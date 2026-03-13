@@ -101,6 +101,50 @@ def _search(query: str, top_k: int = 6) -> list[dict]:
     return results
 
 
+def _run_claude_with_tools(prompt: str, system_prompt: str, extra_dirs: list[str] | None = None) -> dict:
+    """Like _run_claude but keeps Claude's file tools enabled so it can read the knowledge dir."""
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        raise RuntimeError("claude CLI not found in PATH")
+
+    cmd = [
+        claude_bin,
+        "--print",
+        "--output-format", "json",
+        "--system-prompt", system_prompt,
+        "--dangerously-skip-permissions",
+    ]
+    for d in (extra_dirs or []):
+        cmd += ["--add-dir", d]
+    cmd.append(prompt)
+
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()}")
+
+    raw = json.loads(proc.stdout)
+    result_text = raw.get("result", "")
+    stripped = result_text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        inner = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
+        stripped = inner.strip()
+    try:
+        result_data = json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        result_data = result_text
+
+    return {
+        "result": result_data,
+        "session_id": raw.get("session_id"),
+        "cost_usd": raw.get("cost_usd"),
+        "duration_ms": raw.get("duration_ms"),
+        "is_error": raw.get("is_error", False),
+    }
+
+
 def _run_claude(prompt: str, system_prompt: str) -> dict:
     claude_bin = shutil.which("claude")
     if not claude_bin:
@@ -170,6 +214,35 @@ def ask_with_context(prompt: str, extra_context: str) -> dict:
     """Send a prompt with additional context appended to the SKILLS.md system prompt."""
     system_prompt = _load_skills() + "\n\n## Additional Context\n" + extra_context
     return _run_claude(prompt, system_prompt)
+
+
+@mcp.tool
+def ask_knowledge_agent(query: str) -> dict:
+    """
+    Let the Claude agent autonomously explore the knowledge/ folder using its
+    own file tools (Glob, Read, Grep) to find relevant CUDA/Triton docs, papers,
+    and code, then answer the query.  No pre-chunking or BM25 — the agent decides
+    what to read and how deep to go.
+    """
+    knowledge_dir = str(KNOWLEDGE_DIR)
+    prompt = (
+        f"The knowledge base is located at: {knowledge_dir}\n\n"
+        f"## Task\n{query}\n\n"
+        "Instructions:\n"
+        "1. Use Glob to list files in the knowledge base directory tree.\n"
+        "2. Use Grep to search for terms most relevant to the query across those files.\n"
+        "3. Use Read to open the most promising files or sections.\n"
+        "4. Synthesise a precise answer grounded in what you actually read.\n"
+        "5. Cite every source file you used (relative path).\n"
+        "6. Return your answer as structured JSON per the format in your system prompt."
+    )
+    system_prompt = (
+        _load_skills()
+        + "\n\nYou have full read access to a local knowledge base of CUDA/Triton "
+          "documentation, papers, and optimized kernel code. Always read the files "
+          "yourself before answering — do not guess from training data alone."
+    )
+    return _run_claude_with_tools(prompt, system_prompt, extra_dirs=[knowledge_dir])
 
 
 @mcp.tool
