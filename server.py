@@ -270,6 +270,8 @@ def ask_knowledge_agent(query: str) -> dict:
         + "\n\nYou have full read access to a local knowledge base of CUDA "
           "documentation. Always read the files "
           "yourself before answering — do not guess from training data alone."
+          "When searching for information, always read the index.json file in each folder first to identify relevant files. "
+          "Only read files referenced in the index.json that are relevant to the user's query. Read less than 5 files"
     )
     return _run_claude_with_tools(prompt, system_prompt, extra_dirs=[knowledge_dir])
 
