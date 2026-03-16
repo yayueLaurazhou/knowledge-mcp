@@ -4,19 +4,22 @@ import os
 import re
 import subprocess
 import shutil
+import sys
 from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
 from rank_bm25 import BM25Okapi
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    force=True,
-)
 log = logging.getLogger("knowledge-mcp")
+log.setLevel(logging.INFO)
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+log.addHandler(_handler)
+log.propagate = False  # don't feed into FastMCP's root handler chain
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 BASE = Path(__file__).parent
