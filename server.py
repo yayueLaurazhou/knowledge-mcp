@@ -188,7 +188,7 @@ def _run_claude(prompt: str, system_prompt: str) -> dict:
     # Strip CLAUDECODE so the subprocess isn't blocked as a nested session
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
 
     if proc.returncode != 0:
         log.error("claude failed (exit %d): %s", proc.returncode, proc.stderr.strip())
