@@ -228,13 +228,6 @@ def ask_knowledge_agent(query: str) -> dict:
     prompt = (
         f"The knowledge base is located at: {knowledge_dir}\n\n"
         f"## Task\n{query}\n\n"
-        "Instructions:\n"
-        "1. Use Glob to list files in the knowledge base directory tree.\n"
-        "2. Use Grep to search for terms most relevant to the query across those files.\n"
-        "3. Use Read to open the most promising files or sections.\n"
-        "4. Synthesise a precise answer grounded in what you actually read.\n"
-        "5. Cite every source file you used (relative path).\n"
-        "6. Return your answer as structured JSON per the format in your system prompt."
     )
     system_prompt = (
         _load_skills()
