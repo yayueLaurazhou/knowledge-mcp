@@ -60,22 +60,13 @@ Claude itself explores the `knowledge/` folder using its built-in file tools (`G
 uv sync
 
 # Register with Claude Code
-# Already written to ~/.claude.json as "knowledge-mcp"
-# Restart Claude Code — the server appears under /mcp
+
+claude mcp remove knowledge-mcp -s user
+
+claude mcp add --transport sse --scope user knowledge-mcp http://127.0.0.1:8000/sse
 ```
 
-## Populating the knowledge base
 
-Drop any of the following into `knowledge/` (subdirectories are fine):
-
-| Extension | Use for |
-|---|---|
-| `.md` `.txt` `.rst` | Documentation, paper summaries, notes |
-| `.py` | Triton kernels, PyTorch CUDA extensions |
-| `.cu` `.cuh` `.c` `.cpp` | CUDA C++ kernels |
-| `.triton` | Raw Triton IR |
-
-The BM25 index is rebuilt on every query — no separate indexing step needed.
 
 ## Customising agent behaviour
 

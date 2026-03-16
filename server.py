@@ -31,6 +31,81 @@ INDEXED_EXTENSIONS = {".md", ".txt", ".rst", ".py", ".cu", ".cuh", ".c", ".cpp",
 
 mcp = FastMCP("knowledge-mcp")
 
+# ── mcp library bug-fixes ───────────────────────────────────────────────────
+# Two race-condition bugs exist in mcp 1.26.0 / fastmcp 3.1.1:
+#
+# Bug 1 (shared/session.py _receive_loop): when a request arrives before the
+#   MCP initialise handshake completes, ServerSession._received_request raises
+#   RuntimeError.  The exception is caught upstream and a JSON-RPC error is
+#   sent, but the RequestResponder is left stuck in _in_flight with no cleanup.
+#
+# Bug 2 (shared/session.py _receive_loop notification branch): the subsequent
+#   notifications/cancelled for that stale responder calls responder.cancel(),
+#   which raises RuntimeError("RequestResponder must be used as a context
+#   manager") because the responder was never __enter__-ed.
+#
+# Fix for Bug 1: override _received_request so that pre-init requests are
+# rejected via a proper `with responder:` block (which calls on_complete and
+# removes the responder from _in_flight) instead of raising.
+#
+# Fix for Bug 2: patch RequestResponder.cancel to silently handle the case
+# where _entered is False (defensive belt-and-suspenders).
+
+from mcp.server.session import ServerSession as _ServerSession, InitializationState as _InitState
+from mcp.shared.session import RequestResponder as _RequestResponder
+from mcp.types import (
+    ErrorData as _ErrorData,
+    INVALID_PARAMS as _INVALID_PARAMS,
+    InitializeRequest as _InitializeRequest,
+    PingRequest as _PingRequest,
+)
+
+_orig_received_request = _ServerSession._received_request
+
+
+async def _patched_received_request(self, responder) -> None:
+    """Reject pre-init requests cleanly (context manager + error response) instead of raising."""
+    root = responder.request.root
+    if (
+        self._initialization_state != _InitState.Initialized
+        and not isinstance(root, (_InitializeRequest, _PingRequest))
+    ):
+        log.debug(
+            "[mcp-patch] rejecting pre-init request %s id=%s",
+            type(root).__name__,
+            responder.request_id,
+        )
+        with responder:
+            await responder.respond(
+                _ErrorData(
+                    code=_INVALID_PARAMS,
+                    message="Server not yet initialized",
+                )
+            )
+        return
+    await _orig_received_request(self, responder)
+
+
+_ServerSession._received_request = _patched_received_request
+
+
+_orig_cancel = _RequestResponder.cancel
+
+
+async def _patched_cancel(self) -> None:
+    """Cancel safely even if the responder was never entered as a context manager."""
+    if not self._entered:
+        self._completed = True
+        try:
+            self._session._in_flight.pop(self.request_id, None)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return
+    await _orig_cancel(self)
+
+
+_RequestResponder.cancel = _patched_cancel
+
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -134,10 +209,17 @@ def _run_claude_with_tools(prompt: str, system_prompt: str, extra_dirs: list[str
     ]
     for d in (extra_dirs or []):
         cmd += ["--add-dir", d]
-    cmd.append(prompt)
 
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+    # Pass the prompt via stdin so variadic args like --add-dir don't swallow it.
+    proc = subprocess.run(
+        cmd,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
 
     if proc.returncode != 0:
         log.error("claude (with tools) failed (exit %d): %s", proc.returncode, proc.stderr.strip())
@@ -182,13 +264,19 @@ def _run_claude(prompt: str, system_prompt: str) -> dict:
         "--output-format", "json",
         "--system-prompt", system_prompt,
         "--dangerously-skip-permissions",
-        prompt,
     ]
 
     # Strip CLAUDECODE so the subprocess isn't blocked as a nested session
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+    proc = subprocess.run(
+        cmd,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
 
     if proc.returncode != 0:
         log.error("claude failed (exit %d): %s", proc.returncode, proc.stderr.strip())
@@ -348,4 +436,5 @@ def reload_skills() -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    # mcp.run()
+    mcp.run(transport="sse", host="127.0.0.1", port=8000)
