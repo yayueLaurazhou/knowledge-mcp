@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import subprocess
@@ -8,6 +9,14 @@ from typing import Optional
 
 from fastmcp import FastMCP
 from rank_bm25 import BM25Okapi
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,
+)
+log = logging.getLogger("knowledge-mcp")
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 BASE = Path(__file__).parent
@@ -58,6 +67,7 @@ def _chunk_text(text: str, source: str, chunk_words: int = 300, overlap: int = 6
 def _build_index() -> tuple[list[dict], Optional[BM25Okapi]]:
     """Walk KNOWLEDGE_DIR, chunk every file, build a BM25 index."""
     if not KNOWLEDGE_DIR.exists():
+        log.warning("Knowledge directory not found: %s", KNOWLEDGE_DIR)
         return [], None
 
     all_chunks: list[dict] = []
@@ -71,14 +81,17 @@ def _build_index() -> tuple[list[dict], Optional[BM25Okapi]]:
                 pass
 
     if not all_chunks:
+        log.warning("No indexable files found in %s", KNOWLEDGE_DIR)
         return [], None
 
+    log.info("Built BM25 index: %d chunks from %s", len(all_chunks), KNOWLEDGE_DIR)
     tokenized = [c["text"].lower().split() for c in all_chunks]
     return all_chunks, BM25Okapi(tokenized)
 
 
 def _search(query: str, top_k: int = 6) -> list[dict]:
     """Return the top_k most relevant chunks for query."""
+    log.info("Searching knowledge base — query=%r top_k=%d", query, top_k)
     chunks, bm25 = _build_index()
     if bm25 is None:
         return []
@@ -98,6 +111,7 @@ def _search(query: str, top_k: int = 6) -> list[dict]:
             results.append({**c, "score": round(float(scores[idx]), 4)})
             seen_sources[c["source"]] = seen_sources.get(c["source"], 0) + 1
 
+    log.info("Search returned %d chunks: %s", len(results), [r["source"] for r in results])
     return results
 
 
@@ -107,6 +121,7 @@ def _run_claude_with_tools(prompt: str, system_prompt: str, extra_dirs: list[str
     if not claude_bin:
         raise RuntimeError("claude CLI not found in PATH")
 
+    log.info("Invoking claude (with tools) — dirs=%s prompt_len=%d", extra_dirs, len(prompt))
     cmd = [
         claude_bin,
         "--print",
@@ -119,9 +134,10 @@ def _run_claude_with_tools(prompt: str, system_prompt: str, extra_dirs: list[str
     cmd.append(prompt)
 
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
 
     if proc.returncode != 0:
+        log.error("claude (with tools) failed (exit %d): %s", proc.returncode, proc.stderr.strip())
         raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()}")
 
     raw = json.loads(proc.stdout)
@@ -136,6 +152,12 @@ def _run_claude_with_tools(prompt: str, system_prompt: str, extra_dirs: list[str
     except (json.JSONDecodeError, TypeError):
         result_data = result_text
 
+    log.info(
+        "claude (with tools) completed — cost=$%.4f duration=%sms is_error=%s",
+        raw.get("cost_usd") or 0,
+        raw.get("duration_ms"),
+        raw.get("is_error", False),
+    )
     return {
         "result": result_data,
         "session_id": raw.get("session_id"),
@@ -150,6 +172,7 @@ def _run_claude(prompt: str, system_prompt: str) -> dict:
     if not claude_bin:
         raise RuntimeError("claude CLI not found in PATH")
 
+    log.info("Invoking claude — prompt_len=%d", len(prompt))
     cmd = [
         claude_bin,
         "--print",
@@ -165,6 +188,7 @@ def _run_claude(prompt: str, system_prompt: str) -> dict:
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
 
     if proc.returncode != 0:
+        log.error("claude failed (exit %d): %s", proc.returncode, proc.stderr.strip())
         raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()}")
 
     raw = json.loads(proc.stdout)
@@ -181,6 +205,12 @@ def _run_claude(prompt: str, system_prompt: str) -> dict:
     except (json.JSONDecodeError, TypeError):
         result_data = result_text
 
+    log.info(
+        "claude completed — cost=$%.4f duration=%sms is_error=%s",
+        raw.get("cost_usd") or 0,
+        raw.get("duration_ms"),
+        raw.get("is_error", False),
+    )
     return {
         "result": result_data,
         "session_id": raw.get("session_id"),
@@ -206,12 +236,14 @@ def _format_context_block(chunks: list[dict]) -> str:
 def ask(prompt: str) -> dict:
     """Send a prompt to a Claude agent using SKILLS.md as the system prompt.
     Returns the agent's response as structured JSON."""
+    log.info("[ask] prompt=%r", prompt[:120])
     return _run_claude(prompt, _load_skills())
 
 
 @mcp.tool
 def ask_with_context(prompt: str, extra_context: str) -> dict:
     """Send a prompt with additional context appended to the SKILLS.md system prompt."""
+    log.info("[ask_with_context] prompt=%r context_len=%d", prompt[:120], len(extra_context))
     system_prompt = _load_skills() + "\n\n## Additional Context\n" + extra_context
     return _run_claude(prompt, system_prompt)
 
@@ -224,6 +256,7 @@ def ask_knowledge_agent(query: str) -> dict:
     and code, then answer the query.  No pre-chunking or BM25 — the agent decides
     what to read and how deep to go.
     """
+    log.info("[ask_knowledge_agent] query=%r", query[:120])
     knowledge_dir = str(KNOWLEDGE_DIR)
     prompt = (
         f"The knowledge base is located at: {knowledge_dir}\n\n"
@@ -241,10 +274,11 @@ def ask_knowledge_agent(query: str) -> dict:
 @mcp.tool
 def ask_knowledge(query: str, top_k: int = 6) -> dict:
     """
-    Search the local knowledge base (knowledge/) for CUDA/Triton docs, papers,
+    Search the local knowledge base (knowledge/) for CUDA docs, papers,
     and code fragments most relevant to 'query', then pass them as grounded
     context to a Claude agent.  Returns a structured JSON answer with citations.
     """
+    log.info("[ask_knowledge] query=%r top_k=%d", query[:120], top_k)
     chunks = _search(query, top_k=top_k)
     context_block = _format_context_block(chunks)
 
@@ -257,7 +291,7 @@ def ask_knowledge(query: str, top_k: int = 6) -> dict:
 
     system_prompt = (
         _load_skills()
-        + "\n\nYou have access to a curated knowledge base of CUDA/Triton documentation, "
+        + "\n\nYou have access to a curated knowledge base of CUDA documentation, "
           "papers, and optimized kernel code. Ground your answers in the retrieved snippets "
           "and always cite the source."
     )
@@ -275,6 +309,7 @@ def search_knowledge(query: str, top_k: int = 8) -> dict:
     Search the knowledge base and return the top matching chunks without
     calling Claude — useful for inspecting what's available before asking.
     """
+    log.info("[search_knowledge] query=%r top_k=%d", query[:120], top_k)
     chunks = _search(query, top_k=top_k)
     if not chunks:
         return {"chunks": [], "message": f"No documents found in {KNOWLEDGE_DIR}"}
@@ -289,6 +324,7 @@ def search_knowledge(query: str, top_k: int = 8) -> dict:
 @mcp.tool
 def list_knowledge() -> dict:
     """List all files currently indexed in the knowledge base."""
+    log.info("[list_knowledge] listing %s", KNOWLEDGE_DIR)
     if not KNOWLEDGE_DIR.exists():
         return {"files": [], "knowledge_dir": str(KNOWLEDGE_DIR)}
 
