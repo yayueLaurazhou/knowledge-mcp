@@ -66,6 +66,12 @@ claude mcp remove knowledge-mcp -s user
 claude mcp add --transport sse --scope user knowledge-mcp http://127.0.0.1:8000/sse
 ```
 
+## Usage
+
+To call it from your claude 
+```
+mcp__knowledge-mcp__ask_knowledge_agent "how to use wgmma"
+```
 
 
 ## Customising agent behaviour
