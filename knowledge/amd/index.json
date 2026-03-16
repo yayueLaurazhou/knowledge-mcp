@@ -1,0 +1,13 @@
+{
+  "description": "AMD ROCm and HIP Knowledge.",
+  "files": [
+    {
+      "id": "amd_rocm_intro",
+      "title": "AMD ROCm & HIP Introduction",
+      "filename": "rocm_intro.md",
+      "tags": ["amd", "rocm", "hip", "porting", "cdna"],
+      "summary": "Introduction to AMD's GPU software stack, HIP programming model differences from CUDA, and CDNA architecture specifics."
+    }
+  ]
+}
+

@@ -1,0 +1,31 @@
+{
+    "description": "Knowledge regarding FlashAttention 4.",
+    "files": [
+        {
+            "id": "reverse_engineered",
+            "title": "We reverse-engineered Flash Attention 4",
+            "filename": "reverse_engineered.md",
+            "tags": [
+                "cuda",
+                "optimization",
+                "flashattention",
+                "warp_specialization",
+                "software_pipelining"
+            ],
+            "summary": "One month ago at Hot Chips, Tri Dao presented preliminary results on Flash Attention 4, the latest addition to the Flash Attention series of CUDA kernels. These kernels are used in the attention layers of Transformer neural networks. Along with more standard matrix multiplications, these calculations are the primary bottlenecks in contemporary generative AI workloads. Billions of dollars and gigawatts of power are being expended on GPUs to run more of these calculations faster. And Flash Attention 4 is the way to run lots of them as fast as possible. This blog post explains how it works."
+        },
+        {
+            "id": "flash_fwd_sm100",
+            "title": "flash_fwd_sm100.py",
+            "filename": "flash_fwd_sm100.py",
+            "tags": [
+                "cuda",
+                "optimization",
+                "flashattention",
+                "warp_specialization",
+                "software_pipelining"
+            ],
+            "summary": "The official implementation of the Flash Attention 4 kernel using CuTe DSL."
+        }
+    ]
+}

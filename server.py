@@ -238,8 +238,8 @@ def ask_knowledge_agent(query: str) -> dict:
     )
     system_prompt = (
         _load_skills()
-        + "\n\nYou have full read access to a local knowledge base of CUDA/Triton "
-          "documentation, papers, and optimized kernel code. Always read the files "
+        + "\n\nYou have full read access to a local knowledge base of CUDA "
+          "documentation. Always read the files "
           "yourself before answering — do not guess from training data alone."
     )
     return _run_claude_with_tools(prompt, system_prompt, extra_dirs=[knowledge_dir])

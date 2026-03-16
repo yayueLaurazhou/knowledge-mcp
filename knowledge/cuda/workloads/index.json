@@ -1,0 +1,9 @@
+{
+    "description": "Representitive workloads on CUDA, such as FlashAttention, MoE etc.",
+    "directories": [
+        {
+            "name": "fa4",
+            "description": "FlashAttention 4 and its optimization."
+        }
+    ]
+}

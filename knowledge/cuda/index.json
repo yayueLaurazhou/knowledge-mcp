@@ -1,0 +1,17 @@
+{
+  "description": "NVIDIA CUDA Knowledge. Contains sub-categories for specific optimization and architectural topics.",
+  "directories": [
+    {
+        "name": "sdk_13_1",
+        "description": "Documentation for CUDA 13.1 SDKs, including CUDA Programming Guide, CUDA Runtime API, CUDA Driver API, CUPTI."
+      },
+    {
+      "name": "ptx_9_1",
+      "description": "NVIDIA PTX (Parallel Thread Execution) ISA 9.1 documentation."
+    },
+    {
+        "name": "workloads",
+        "description": "Representitive workloads on CUDA, such as FlashAttention, MoE etc."
+    }
+  ]
+}
