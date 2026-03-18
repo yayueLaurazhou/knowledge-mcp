@@ -40,7 +40,8 @@ mcp = FastMCP("knowledge-mcp")
 #   sent, but the RequestResponder is left stuck in _in_flight with no cleanup.
 #
 # Bug 2 (shared/session.py _receive_loop notification branch): the subsequent
-#   notifications/cancelled for that stale responder calls responder.cancel(),
+#   notifications/cancel
+# led for that stale responder calls responder.cancel(),
 #   which raises RuntimeError("RequestResponder must be used as a context
 #   manager") because the responder was never __enter__-ed.
 #

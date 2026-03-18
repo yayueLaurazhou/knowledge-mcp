@@ -1,0 +1,730 @@
+# fa2
+
+---
+
+## FlashAttention-2 :
+
+## Faster Attention with Better Parallelism and Work Partitioning
+
+#### Tri Dao 1,2
+
+#### 1 Department of Computer Science, Princeton University
+
+#### 2 Department of Computer Science, Stanford University
+
+3202 trid@cs.stanford.edu
+
+#### July 18, 2023
+
+Abstract Scaling Transformers to longer sequence lengths has been a major problem in the last several years, promising to improve performance in language modeling and high-resolution image understanding, as ] G well as to unlock new applications in code, audio, and video generation. The attention layer is the main bottleneck in scaling to longer sequences, as its runtime and memory increase quadratically in L the sequence length. FlashAttention [5] exploits the asymmetric GPU memory hierarchy to bring . s significantmemorysaving(linearinsteadofquadratic)andruntimespeedup(2-4 × comparedtooptimized c baselines), with no approximation. However, FlashAttention is still not nearly as fast as optimized [ matrix-multiply (GEMM) operations, reaching only 25-40% of the theoretical maximum FLOPs/s. We 1v19680 observe that the inefficiency is due to suboptimal work partitioning between different thread blocks and warpsontheGPU,causingeitherlow-occupancyorunnecessarysharedmemoryreads/writes. Wepropose FlashAttention-2 , with better work partitioning to address these issues. In particular, we (1) tweak thealgorithmtoreducethenumberofnon-matmulFLOPs(2)parallelizetheattentioncomputation,even for a single head, across different thread blocks to increase occupancy, and (3) within each thread block, distribute the work between warpsto reduce communication throughshared memory. These yield around 2 × speedup compared to FlashAttention , reaching 50-73% of the theoretical maximum FLOPs/s on . 7032 A100 and getting close to the efficiency of GEMM operations. We empirically validate that when used end-to-endtotrainGPT-stylemodels, FlashAttention-2 reachestrainingspeedofupto225TFLOPs/s per A100 GPU (72% model FLOPs utilization). 1
+
+### v 1 Introduction
+
+r Scaling up the context length of Transformers [18] is a challenge, since the attention layer at their heart a has runtime and memory requirements quadratic in the input sequence length. Ideally, we would like to go beyond the standard 2k sequence length limit to train models to understand books, high resolution images, and long-form videos. Just within the last year, there have been several language models with much longer context than before: GPT-4 [12] with context length 32k, MosaicML’s MPT with context length 65k, and Anthropic’s Claude with context length 100k. Emerging use cases such as long document querying and story writing have demonstrated a need for models with such long context. To reduce the computational requirement of attention on such long context, there have been numerous methods proposed to approximate attention [2, 3, 4, 8, 9, 14, 19, 20]. Though these methods have seen some use cases, as far as we know, most large-scale training runs still use standard attention. Motivated by this, Dao et al. [5] proposed to reorder the attention computation and leverages classical techniques (tiling, recomputation) to significantly speed it up and reduce memory usage from quadratic to linear in sequence length. This yields 2-4 × wall-clock time speedup over optimized baselines, up to 10-20 × memory saving, 1 FlashAttention-2 isavailableat https://github.com/Dao-AILab/flash-attention
+
+1
+
+with no approximation, and as a result FlashAttention has seen wide adoption in large-scale training and inference of Transformers. However, context length increases even more, FlashAttention is still not nearly as efficient as other primitives such as matrix-multiply (GEMM). In particular, while FlashAttention is already 2-4 × faster than a standard attention implementation, the forward pass only reaches 30-50% of the theoretical maximum FLOPs/s of the device (Fig. 5), while the backward pass is even more challenging, reaching only 25-35% of maximum throughput on A100 GPU (Fig. 6). In contrast, optimized GEMM can reach up to 80-90% of the theoretical maximum device throughput. Through careful profiling, we observe that FlashAttention still has suboptimal work partitioning between different thread blocks and warps on the GPU, causing either low-occupancy or unnecessary shared memory reads/writes. Building on FlashAttention , we propose FlashAttention-2 with better parallelism and work partitioning to address these challenges. 1. InSection3.1, wetweakthealgorithmstoreducethenumberofnon-matmulFLOPswhilenotchanging the output. While the non-matmul FLOPs only account for a small fraction of the total FLOPs, they take longer to perform as GPUs have specialized units for matrix multiply, and as a result the matmul throughput can be up to 16 × higher than non-matmul throughput. It is thus important to reduce non-matmul FLOPs and spend as much time as possible doing matmul FLOPs. 2. Weproposetoparallelizeboththeforwardpassandbackwardpassalongthesequencelengthdimension, in addition to the batch and number of heads dimension. This increases occupancy (utilization of GPU resources) in the case where the sequences are long (and hence batch size is often small). 3. Even within one block of attention computation, we partition the work between different warps of a thread block to reduce communication and shared memory reads/writes. In Section 4, we empirically validate that FlashAttention-2 yields significant speedup compared to even FlashAttention . Benchmarks on different settings (with or without causal mask, different head dimensions) show that FlashAttention-2 achieves around 2 × speedup over FlashAttention , reaching up to 73% of the theoretical max throughput in the forward pass, and up to 63% of the theoretical max throughput in the backward pass. When used end-to-end to train GPT-style models, we reach training speed of up to 225 TFLOPs/s per A100 GPU.
+
+### 2 Background
+
+We provide some background on the performance characteristics and execution model of GPUs. We also describe the standard implementation of attention, as well as FlashAttention .
+
+#### 2.1 Hardware characteristics
+
+GPU performance characteristics. TheGPUconsistsofcomputeelements(e.g.,floatingpointarithmetic units) and a memory hierarchy. Most modern GPUs contain specialized units to accelerate matrix multiply in low-precision (e.g., Tensor Cores on Nvidia GPUs for FP16/BF16 matrix multiply). The memory hierarchy comprise of high bandwidth memory (HBM), and on-chip SRAM (aka shared memory). As an example, the A100 GPU has 40-80GB of high bandwidth memory (HBM) with bandwidth 1.5-2.0TB/s and 192KB of on-chip SRAM per each of 108 streaming multiprocessors with bandwidth estimated around 19TB/s [6, 7]. As the L2 cache is not directly controllable by the programmer, we focus on the HBM and SRAM for the purpose of this discussion. Execution Model. GPUs have a massive number of threads to execute an operation (called a kernel). Threads are organized into thread blocks, which are scheduled to run on streaming multiprocessors (SMs). Within each thread blocks, threads are grouped into warps (a group of 32 threads). Threads within a warp can communicate by fast shuffle instructions or cooperate to perform matrix multiply. Warps within a thread block can communicate by reading from / writing to shared memory. Each kernel loads inputs from HBM to registers and SRAM, computes, then writes outputs to HBM.
+
+2
+
+#### 2.2 Standard Attention Implementation
+
+Given input sequences Q , K , V ∈ R 𝑁 × 𝑑 where 𝑁 is the sequence length and 𝑑 is the head dimension, we want to compute the attention output O ∈ R 𝑁 × 𝑑 : S = QK ⊤ ∈ R 𝑁 × 𝑁 , P = softmax ( S ) ∈ R 𝑁 × 𝑁 , O = PV ∈ R 𝑁 × 𝑑 , where softmax is applied row-wise. 2 For multi-head attention (MHA), this same computation is performed in parallel across many heads, and parallel over the batch dimension (number of input sequences in a batch). The backward pass of attention proceeds as follows. Let dO ∈ R 𝑁 × 𝑑 be the gradient of O with respect to some loss function. Then by the chain rule (aka backpropagation): dV = P ⊤ dO ∈ R 𝑁 × 𝑑 dP = dOV ⊤ ∈ R 𝑁 × 𝑁 dS = dsoftmax ( dP ) ∈ R 𝑁 × 𝑁 dQ = dSK ∈ R 𝑁 × 𝑑 dK = QdS ⊤ ∈ R 𝑁 × 𝑑 , where dsoftmax is the gradient (backward pass) of softmax applied row-wise. One can work out that if 𝑝 = softmax ( 𝑠 ) for some vector 𝑠 and 𝑝 , then with output gradient 𝑑𝑝 , the input gradient 𝑑𝑠 = ( diag ( 𝑝 )− 𝑝𝑝 ⊤ ) 𝑑𝑝 . Standard attention implementations materialize the matrices S and P to HBM, which takes 𝑂 ( 𝑁 2 ) memory. Often 𝑁 ≫ 𝑑 (typically 𝑁 is on the order of 1k–8k and 𝑑 is around 64–128). The standard attention implementation (1) calls the matrix multiply (GEMM) subroutine to multiply S = QK ⊤ , writes the result to HBM, then (2) loads § from HBM to compute softmax and write the result P to HBM, and finally (3) calls GEMM to get O = PV . As most of the operations are bounded by memory bandwidth, the large number of memory accesses translates to slow wall-clock time. Moreover, the required memory is 𝑂 ( 𝑁 2 ) due to having to materialize S and P . Moreover, one has to save P ∈ R 𝑁 × 𝑁 for the backward pass to compute the gradients.
+
+#### 2.3 FlashAttention
+
+TospeedupattentiononhardwareacceleratorssuchasGPU,[5]proposesanalgorithmtoreducethememory reads/writes while maintaining the same output (without approximation).
+
+2.3.1 Forward pass FlashAttention applies the classical technique of tiling to reduce memory IOs, by (1) loading blocks of inputs from HBM to SRAM, (2) computing attention with respect to that block, and then (3) updating the output without writing the large intermediate matrices S and P to HBM. As the softmax couples entire rows or blocks of row, online softmax [11, 13] can split the attention computation into blocks, and rescale the output of each block to finally get the right result (with no approximation). By significantly reducing the amount of memory reads/writes, FlashAttention yields 2-4 × wall-clock speedup over optimized baseline attention implementations. We describe the online softmax technique [11] and how it is used in attention [13]. For simplicity, consider just one row block of the attention matrix S , of the form (cid:2) S ( 1 ) S ( 2 ) (cid:3) for some matrices S ( 1 ) , S ( 2 ) ∈ R 𝐵 𝑟 × 𝐵 𝑐 , where 𝐵 and 𝐵 are the row and column block sizes. We want to compute softmax of this row block and 𝑟 𝑐 (cid:20) V ( 1 ) (cid:21) multiply with the value, of the form for some matrices V ( 1 ) , V ( 2 ) ∈ R 𝐵 𝑐 × 𝑑 . Standard softmax would V ( 2 ) 2 Forclarityofexposition,weomitthescalingof QK ⊤ (typicallyby 1 / d ),andoptionallyelementwisemaskingon S and/or dropoutappliedto P
+
+3
+
+compute: 𝑚 = max ( rowmax ( S ( 1 ) ) , rowmax ( S ( 2 ) )) ∈ R 𝐵 𝑟 ℓ = rowsum ( 𝑒 S ( 1 ) − 𝑚 )+ rowsum ( 𝑒 S ( 2 ) − 𝑚 ) ∈ R 𝐵 𝑟 P = (cid:2) P ( 1 ) P ( 2 ) (cid:3) = diag ( ℓ ) − 1 (cid:104) 𝑒 S ( 1 ) − 𝑚 𝑒 S ( 2 ) − 𝑚 (cid:105) ∈ R 𝐵 𝑟 × 2 𝐵 𝑐 (cid:20) V ( 1 ) (cid:21) O = (cid:2) P ( 1 ) P ( 2 ) (cid:3) = diag ( ℓ ) − 1 𝑒 S ( 1 ) − 𝑚 V ( 1 ) + 𝑒 S ( 2 ) − 𝑚 V ( 2 ) ∈ R 𝐵 𝑟 × 𝑑 . V ( 2 ) Online softmax instead computes “local” softmax with respect to each block and rescale to get the right output at the end: 𝑚 ( 1 ) = rowmax ( S ( 1 ) ) ∈ R 𝐵 𝑟 ℓ ( 1 ) = rowsum ( 𝑒 S ( 1 ) − 𝑚 ( 1 ) ) ∈ R 𝐵 𝑟 P ˜ ( 1 ) = diag ( ℓ ( 1 ) ) − 1 𝑒 S ( 1 ) − 𝑚 ( 1 ) ∈ R 𝐵 𝑟 × 𝐵 𝑐 O ( 1 ) = P ˜ ( 1 ) V ( 1 ) = diag ( ℓ ( 1 ) ) − 1 𝑒 S ( 1 ) − 𝑚 ( 1 ) V ( 1 ) ∈ R 𝐵 𝑟 × 𝑑 𝑚 ( 2 ) = max ( 𝑚 ( 1 ) , rowmax ( S ( 2 ) )) = 𝑚 ℓ ( 2 ) = 𝑒 𝑚 ( 1 ) − 𝑚 ( 2 ) ℓ ( 1 ) + rowsum ( 𝑒 S ( 2 ) − 𝑚 ( 2 ) ) = rowsum ( 𝑒 S ( 1 ) − 𝑚 )+ rowsum ( 𝑒 S ( 2 ) − 𝑚 ) = ℓ P ˜ ( 2 ) = diag ( ℓ ( 2 ) ) − 1 𝑒 S ( 2 ) − 𝑚 ( 2 ) O ( 2 ) = diag ( ℓ ( 1 ) / ℓ ( 2 ) ) − 1 O ( 1 ) + P ˜ ( 2 ) V ( 2 ) = diag ( ℓ ( 2 ) ) − 1 𝑒 𝑠 ( 1 ) − 𝑚 V ( 1 ) + diag ( ℓ ( 2 ) ) − 1 𝑒 𝑠 ( 2 ) − 𝑚 V ( 2 ) = O . Weshowhow FlashAttention usesonlinesoftmaxtoenabletiling(Fig.1)toreducememoryreads/writes.
+
+Figure 1: Diagram of how FlashAttention forward pass is performed, when the key K is partitioned into two blocks and the value V is also partitioned into two blocks. By computing attention with respect to each block and rescaling the output, we get the right answer at the end, while avoiding expensive memory reads/writes of the intermediate matrices S and P . We simplify the diagram, omitting the step in softmax that subtracts each element by the row-wise max.
+
+4
+
+2.3.2 Backward pass In the backward pass, by re-computing the values of the attention matrices S and P once blocks of inputs Q , K , V are already loaded to SRAM, FlashAttention avoids having to store large intermediate values. By not having to save the large matrices S and P of size 𝑁 × 𝑁 , FlashAttention yields 10-20 × memory saving depending on sequence length (memory required in linear in sequence length 𝑁 instead of quadratic). The backward pass also achieves 2-4 × wall-clock speedup due to reduce memory reads/writes. The backward pass applies tiling to the equations in Section 2.2. Though the backward pass is simpler than the forward pass conceptually (there is no softmax rescaling), the implementation is significantly more involved. This is because there are more values to be kept in SRAM to perform 5 matrix multiples in the backward pass, compared to just 2 matrix multiples in the forward pass.
+
+### 3 FlashAttention-2 : Algorithm, Parallelism, and Work Partition-
+
+### ing
+
+Wedescribethe FlashAttention-2 algorithm,whichincludesseveraltweaksto FlashAttention toreduce the number of non-matmul FLOPs. We then describe how to parallelize the computation on different thread blocks to make full use the GPU resources. Finally we describe we partition the work between different warps within one thread block to reduce the amount of shared memory access. These improvements lead to 2-3 × speedup as validated in Section 4.
+
+#### 3.1 Algorithm
+
+We tweak the algorithm from FlashAttention to reduce the number of non-matmul FLOPs. This is because modern GPUs have specialized compute units (e.g., Tensor Cores on Nvidia GPUs) that makes matmul much faster. As an example, the A100 GPU has a max theoretical throughput of 312 TFLOPs/s of FP16/BF16 matmul, but only 19.5 TFLOPs/s of non-matmul FP32. Another way to think about this is that each non-matmul FLOP is 16 × more expensive than a matmul FLOP. To maintain high throughput (e.g., more than 50% of the maximum theoretical TFLOPs/s), we want to spend as much time on matmul FLOPs as possible.
+
+3.1.1 Forward pass We revisit the online softmax trick as shown in Section 2.3 and make two minor tweaks to reduce non-matmul FLOPs: 1. We do not have to rescale both terms of the output update by diag ( ℓ ( 2 ) ) − 1 : O ( 2 ) = diag ( ℓ ( 1 ) / ℓ ( 2 ) ) − 1 O ( 1 ) + diag ( ℓ ( 2 ) ) − 1 𝑒 S ( 2 ) − 𝑚 ( 2 ) V ( 2 ) . We can instead maintain an “un-scaled” version of O ( 2 ) and keep around the statistics ℓ ( 2 ) : O ˜ ( 2 ) = diag ( ℓ ( 1 ) ) − 1 O ( 1 ) + 𝑒 S ( 2 ) − 𝑚 ( 2 ) V ( 2 ) . Only at the every end of the loop do we scale the final O ˜ ( last ) by diag ( ℓ ( last ) ) − 1 to get the right output. 2. We do not have to save both the max 𝑚 ( 𝑗 ) and the sum of exponentials ℓ ( 𝑗 ) for the backward pass. We only need to store the logsumexp 𝐿 ( 𝑗 ) = 𝑚 ( 𝑗 ) + log ( ℓ ( 𝑗 ) ) .
+
+5
+
+In the simple case of 2 blocks in Section 2.3, the online softmax trick now becomes: 𝑚 ( 1 ) = rowmax ( S ( 1 ) ) ∈ R 𝐵 𝑟 ℓ ( 1 ) = rowsum ( 𝑒 S ( 1 ) − 𝑚 ( 1 ) ) ∈ R 𝐵 𝑟 O ˜ ( 1 ) = 𝑒 S ( 1 ) − 𝑚 ( 1 ) V ( 1 ) ∈ R 𝐵 𝑟 × 𝑑 𝑚 ( 2 ) = max ( 𝑚 ( 1 ) , rowmax ( S ( 2 ) )) = 𝑚 ℓ ( 2 ) = 𝑒 𝑚 ( 1 ) − 𝑚 ( 2 ) ℓ ( 1 ) + rowsum ( 𝑒 S ( 2 ) − 𝑚 ( 2 ) ) = rowsum ( 𝑒 S ( 1 ) − 𝑚 )+ rowsum ( 𝑒 S ( 2 ) − 𝑚 ) = ℓ P ˜ ( 2 ) = diag ( ℓ ( 2 ) ) − 1 𝑒 S ( 2 ) − 𝑚 ( 2 ) O ˜ ( 2 ) = diag ( 𝑒 𝑚 ( 1 ) − 𝑚 ( 2 ) ) − 1 O ˜ ( 1 ) + 𝑒 S ( 2 ) − 𝑚 ( 2 ) V ( 2 ) = 𝑒 𝑠 ( 1 ) − 𝑚 V ( 1 ) + 𝑒 𝑠 ( 2 ) − 𝑚 V ( 2 ) O ( 2 ) = diag ( ℓ ( 2 ) ) − 1 O ˜ ( 2 ) = O . We describe the full FlashAttention-2 forward pass in Algorithm 1.
+
+Algorithm 1 FlashAttention-2 forward pass Require: Matrices Q , K , V ∈ R 𝑁 × 𝑑 in HBM, block sizes 𝐵 𝑐 , 𝐵 𝑟 . 1: Divide Q into 𝑇 = (cid:108) 𝑁 (cid:109) blocks Q ,..., Q of size 𝐵 × 𝑑 each, and divide K , V in to 𝑇 = (cid:108) 𝑁 (cid:109) blocks 𝑟 𝐵 𝑟 1 𝑇 𝑟 𝑟 𝑐 𝐵 𝑐 K ,..., K 𝑇 and V ,..., V 𝑇 , of size 𝐵 𝑐 × 𝑑 each. 1 𝑐 1 𝑐 2: Divide the output O ∈ R 𝑁 × 𝑑 into 𝑇 𝑟 blocks O 𝑖 ,..., O 𝑇 of size 𝐵 𝑟 × 𝑑 each, and divide the logsumexp 𝐿 𝑟 into 𝑇 blocks 𝐿 ,...,𝐿 of size 𝐵 each. 𝑟 𝑖 𝑇 𝑟 𝑟 3: for 1 ≤ 𝑖 ≤ 𝑇 𝑟 do 4: Load Q 𝑖 from HBM to on-chip SRAM. 5: On chip, initialize O ( 0 ) = ( 0 ) 𝐵 𝑑 ∈ R 𝐵 𝑟 × 𝑑 ,ℓ ( 0 ) = ( 0 ) 𝐵 ∈ R 𝐵 𝑟 ,𝑚 ( 0 ) = (−∞) 𝐵 ∈ R 𝐵 𝑟 . 𝑖 𝑟 × 𝑖 𝑟 𝑖 𝑟 6: for 1 ≤ 𝑗 ≤ 𝑇 𝑐 do 7: Load K 𝑗 , V 𝑗 from HBM to on-chip SRAM. 8: On chip, compute S ( 𝑗 ) = Q 𝑖 K 𝑇 ∈ R 𝐵 𝑟 × 𝐵 𝑐 . 𝑖 𝑗 9: On chip, compute 𝑚 ( 𝑗 ) = max ( 𝑚 ( 𝑗 − 1 ) , rowmax ( S ( 𝑗 ) )) ∈ R 𝐵 𝑟 , P ˜ ( 𝑗 ) = exp ( S ( 𝑗 ) − 𝑚 ( 𝑗 ) ) ∈ R 𝐵 𝑟 × 𝐵 𝑐 𝑖 𝑖 𝑖 𝑖 𝑖 𝑖 (pointwise), ℓ ( 𝑗 ) = 𝑒 𝑚 𝑖 𝑗 − 1 − 𝑚 𝑖 ( 𝑗 ) ℓ ( 𝑗 − 1 ) + rowsum ( P ˜ ( 𝑗 ) ) ∈ R 𝐵 𝑟 . 𝑖 𝑖 𝑖 10: On chip, compute O ( 𝑗 ) = diag ( 𝑒 𝑚 𝑖 ( 𝑗 − 1 ) − 𝑚 𝑖 ( 𝑗 ) ) − 1 O ( 𝑗 − 1 ) + P ˜ ( 𝑗 ) V . 𝑖 𝑖 𝑖 𝑗 11: end for 12: On chip, compute O 𝑖 = diag ( ℓ ( 𝑇 𝑐 ) ) − 1 O ( 𝑇 𝑐 ) . 𝑖 𝑖 13: On chip, compute 𝐿 = 𝑚 ( 𝑇 𝑐 ) + log ( ℓ ( 𝑇 𝑐 ) ) . 𝑖 𝑖 𝑖 14: Write O 𝑖 to HBM as the 𝑖 -th block of O . 15: Write 𝐿 𝑖 to HBM as the 𝑖 -th block of 𝐿 . 16: end for 17: Return the output O and the logsumexp 𝐿 .
+
+Causal masking. One common use case of attention is in auto-regressive language modeling, where we need to apply a causal mask to the attention matrix S (i.e., any entry S with 𝑗 >𝑖 is set to −∞ ). 𝑖𝑗 1. As FlashAttention and FlashAttention-2 already operate by blocks, for any blocks where all the column indices are more than the row indices (approximately half of the blocks for large sequence length), we can skip the computation of that block. This leads to around 1.7-1.8 × speedup compared to attention without the causal mask. 2. We do not need to apply the causal mask for blocks whose row indices are guaranteed to be strictly less than the column indices. This means that for each row, we only need apply causal mask to 1 block (assuming square block).
+
+6
+
+Correctness, runtime, and memory requirement. As with FlashAttention , Algorithm 1 returns the correct output O = softmax ( QK ⊤ ) V (with no approximation), using 𝑂 ( 𝑁 2 𝑑 ) FLOPs and requires 𝑂 ( 𝑁 ) additional memory beyond inputs and output (to store the logsumexp 𝐿 ). The proof is almost the same as the proof of Dao et al. [5, Theorem 1], so we omit it here.
+
+3.1.2 Backward pass The backward pass of FlashAttention-2 is almost the same as that of FlashAttention . We make a minor tweak to only use the row-wise logsumexp 𝐿 instead of both the row-wise max and row-wise sum of exponentials in the softmax. We include the backward pass description in Algorithm 2 for completeness.
+
+Algorithm 2 FlashAttention-2 Backward Pass Require: Matrices Q , K , V , O , dO ∈ R 𝑁 × 𝑑 in HBM, vector 𝐿 ∈ R 𝑁 in HBM, block sizes 𝐵 𝑐 , 𝐵 𝑟 . 1: Divide Q into 𝑇 = (cid:108) 𝑁 (cid:109) blocks Q ,..., Q of size 𝐵 × 𝑑 each, and divide K , V in to 𝑇 = (cid:108) 𝑁 (cid:109) blocks 𝑟 𝐵 𝑟 1 𝑇 𝑟 𝑟 𝑐 𝐵 𝑐 K ,..., K 𝑇 and V ,..., V 𝑇 , of size 𝐵 𝑐 × 𝑑 each. 1 𝑐 1 𝑐 2: Divide O into 𝑇 𝑟 blocks O 𝑖 ,..., O 𝑇 of size 𝐵 𝑟 × 𝑑 each, divide dO into 𝑇 𝑟 blocks dO 𝑖 ,..., dO 𝑇 of size 𝑟 𝑟 𝐵 × 𝑑 each, and divide 𝐿 into 𝑇 blocks 𝐿 ,...,𝐿 of size 𝐵 each. 𝑟 𝑟 𝑖 𝑇 𝑟 𝑟 3: Initialize dQ = ( 0 ) 𝑁 × 𝑑 in HBM and divide it into 𝑇 𝑟 blocks dQ ,..., dQ 𝑇 of size 𝐵 𝑟 × 𝑑 each. Divide dK , dV ∈ R 𝑁 × 𝑑 in to 𝑇 blocks dK ,..., dK and dV ,..., dV 1 , of size 𝐵 𝑟 × 𝑑 each. 𝑐 1 𝑇 𝑐 1 𝑇 𝑐 𝑐 4: Compute 𝐷 = rowsum ( dO ◦ O ) ∈ R 𝑑 (pointwise multiply), write 𝐷 to HBM and divide it into 𝑇 𝑟 blocks 𝐷 ,...,𝐷 of size 𝐵 each. 1 𝑇 𝑟 𝑟 5: for 1 ≤ 𝑗 ≤ 𝑇 𝑐 do 6: Load K 𝑗 , V 𝑗 from HBM to on-chip SRAM. 7: Initialize dK 𝑗 = ( 0 ) 𝐵 × 𝑑 , dV 𝑗 = ( 0 ) 𝐵 × 𝑑 on SRAM. 𝑐 𝑐 8: for 1 ≤ 𝑖 ≤ 𝑇 𝑟 do 9: Load Q 𝑖 , O 𝑖 , dO 𝑖 , dQ 𝑖 ,𝐿 𝑖 ,𝐷 𝑖 from HBM to on-chip SRAM. 10: On chip, compute S ( 𝑗 ) = Q 𝑖 K 𝑇 ∈ R 𝐵 𝑟 × 𝐵 𝑐 . 𝑖 𝑗 11: On chip, compute P ( 𝑗 ) = exp ( S 𝑖𝑗 − 𝐿 𝑖 ) ∈ R 𝐵 𝑟 × 𝐵 𝑐 . 𝑖 12: On chip, compute dV 𝑗 ← dV 𝑗 +( P ( 𝑗 ) ) ⊤ dO 𝑖 ∈ R 𝐵 𝑐 × 𝑑 . 𝑖 13: On chip, compute dP ( 𝑗 ) = dO 𝑖 V ⊤ ∈ R 𝐵 𝑟 × 𝐵 𝑐 . 𝑖 𝑗 14: On chip, compute dS ( 𝑗 ) = P ( 𝑗 ) ◦( dP ( 𝑗 ) − 𝐷 ) ∈ R 𝐵 𝑟 × 𝐵 𝑐 . 𝑖 𝑖 𝑖 𝑖 15: Load dQ from HBM to SRAM, then on chip, update dQ ← dQ + dS ( 𝑗 ) K 𝑗 ∈ R 𝐵 𝑟 × 𝑑 , and write back 𝑖 𝑖 𝑖 𝑖 to HBM. 16: On chip, compute dK 𝑗 ← dK 𝑗 + dS ( 𝑗 ) ⊤ Q 𝑖 ∈ R 𝐵 𝑐 × 𝑑 . 𝑖 17: end for 18: Write dK 𝑗 , dV 𝑗 to HBM. 19: end for 20: Return dQ , dK , dV .
+
+Multi-query attention and grouped-query attention. Multi-query attention (MQA) [15] and grouped- query attention (GQA) [1] are variants of attention where multiple heads of query attend to the same head of key and value, in order to reduce the size of KV cache during inference. Instead of having to duplicate the key and value heads for the computation, we implicitly manipulate the indices into the head to perform the same computation. In the backward pass, we need to sum the gradients dK and dV across different heads that were implicitly duplicated.
+
+#### 3.2 Parallelism
+
+The first version of FlashAttention parallelizes over batch size and number of heads. We use 1 thread block to process one attention head, and there are overall batch size · number of heads thread blocks. Each thread block is scheduled to run on a streaming multiprocessor (SM), and there are 108 of these SMs on
+
+7
+
+an A100 GPU for example. This scheduling is efficient when this number is large (say ≥ 80 ), since we can effectively use almost all of the compute resources on the GPU. In the case of long sequences (which usually means small batch sizes or small number of heads), to make better use of the multiprocessors on the GPU, we now additionally parallelize over the sequence length dimension. This results in significant speedup for this regime.
+
+Forward pass. We see that the outer loop (over sequence length) is embarrassingly parallel, and we schedulethemondifferentthreadblocksthatdonotneedtocommunicatewitheachother. Wealsoparallelize over the batch dimension and number of heads dimension, as done in FlashAttention . The increased parallelism over sequence length helps improve occupancy (fraction of GPU resources being used) when the batch size and number of heads are small, leading to speedup in this case. These ideas of swapping the order of the loop (outer loop over row blocks and inner loop over column blocks, instead of the other way round in the original FlashAttention paper), as well as parallelizing over the sequence length dimension were first suggested and implemented by Phil Tillet in the Triton [17] implementation. 3
+
+Backward pass. Notice that the only shared computation between different column blocks is in update dQ in Algorithm 2, where we need to load dQ from HBM to SRAM, then on chip, update dQ ← dQ + dS ( 𝑗 ) K 𝑗 , 𝑖 𝑖 𝑖 𝑖 and write back to HBM. We thus parallelize over the sequence length dimension as well, and schedule 1 thread block for each column block of the backward pass. We use atomic adds to communicate between different thread blocks to update dQ . We describe the parallelization scheme in Fig. 2.
+
+Figure 2: In the forward pass (left), we parallelize the workers (thread blocks) where each worker takes care of a block of rows of the attention matrix. In the backward pass (right), each worker takes care of a block of columns of the attention matrix.
+
+3 https://github.com/openai/triton/blob/main/python/tutorials/06-fused-attention.py
+
+8
+
+#### 3.3 Work Partitioning Between Warps
+
+As Section 3.2 describe how we schedule thread blocks, even within each thread block, we also have to decide how to partition the work between different warps. We typically use 4 or 8 warps per thread block, and the partitioning is described in Fig. 3.
+
+Forward pass. For eachblock, FlashAttention splits K and V across 4 warps while keeping Q accessible by all warps. Each warp multiplies to get a slice of QK ⊤ , then they need to multiply with a slice of V and communicate to add up the result. This is referred to as the “split-K” scheme. However, this is inefficient since all warps need to write their intermediate results out to shared memory, synchronize, then add up the intermediate results. These shared memory reads/writes slow down the forward pass in FlashAttention . In FlashAttention-2 , we instead split Q across 4 warps while keeping K and V accessible by all warps. After each warp performs matrix multiply to get a slice of QK ⊤ , they just need to multiply with their shared slice of V to get their corresponding slice of the output. There is no need for communication between warps. The reduction in shared memory reads/writes yields speedup (Section 4).
+
+(a) FlashAttention (b) FlashAttention-2 Figure 3: Work partitioning between different warps in the forward pass
+
+Backward pass. Similarly for the backward pass, we choose to partition the warps to avoid the “split-K” scheme. However, it still requires some synchronization due to the more complicated dependency between all the different inputs and gradients Q , K , V , O , dO , dQ , dK , dV . Nevertheless, avoiding “split-K” reduces shared memory reads/writes and again yields speedup (Section 4).
+
+Tuning block sizes Increasing block sizes generally reduces shared memory loads/stores, but increases the number of registers required and the total amount of shared memory. Past a certain block size, register spilling causes significant slowdown, or the amount of shared memory required is larger than what the GPU has available, and the kernel cannot run at all. Typically we choose blocks of size { 64 , 128 }×{ 64 , 128 } , depending on the head dimension 𝑑 and the device shared memory size. We manually tune for each head dimensions since there are essentially only 4 choices for block sizes, but this could benefit from auto-tuning to avoid this manual labor. We leave this to future work.
+
+### 4 Empirical Validation
+
+We evaluate the impact of using FlashAttention-2 to train Transformer models. • Benchmarking attention. We measure the runtime of FlashAttention-2 across different sequence lengthsandcompareittoastandardimplementationinPyTorch, FlashAttention ,and FlashAttention in Triton. We confirm that FlashAttention-2 is 1.7-3.0 × faster than FlashAttention , 1.3-2.5 × faster than FlashAttention in Triton, and 3-10 × faster than a standard attention implementation.
+
+9
+
+FlashAttention-2 reaches up to 230 TFLOPs/s, 73% of the theoretical maximum TFLOPs/s on A100 GPUs. • End-to-end training speed When used end-to-end to train GPT-style models of size 1.3B and 2.7B on sequence lengths either 2k or 8k, FlashAttention-2 yields up to 1.3 × speedup compared to FlashAt- tention and 2.8 × speedup compared to a baseline without FlashAttention . FlashAttention-2 reaches up to 225 TFLOPs/s (72% model FLOPs utilization) per A100 GPU.
+
+#### 4.1 Benchmarking Attention
+
+We measure the runtime of different attention methods on an A100 80GB SXM4 GPU for different settings (without / with causal mask, head dimension 64 or 128). We report the results in Fig. 4, Fig. 5 and Fig. 6, showing that FlashAttention-2 is around 2 × faster than FlashAttention and FlashAttention in xformers (the “cutlass” implementation). FlashAttention-2 is around 1.3-1.5 × faster than FlashAtten- tion in Triton in the forward pass and around 2 × faster in the backward pass. Compared to a standard attention implementation in PyTorch, FlashAttention-2 can be up to 10 × faster. Benchmark setting: we vary the sequence length from 512, 1k, ..., 16k, and set batch size so that the total number of tokens is 16k. We set hidden dimension to 2048, and head dimension to be either 64 or 128 (i.e., 32 heads or 16 heads). To calculate the FLOPs of the forward pass, we use: 4 · seqlen 2 · head dimension · number of heads . With causal mask, we divide this number by 2 to account for the fact that approximately only half of the entries are calculated. To get the FLOPs of the backward pass, we multiply the forward pass FLOPs by 2.5 (since there are 2 matmuls in the forward pass and 5 matmuls in the backward pass, due to recomputation).
+
+Attention forward + backward speed (A100 80GB SXM4) Attention forward + backward speed (A100 80GB SXM4)
+
+| Pytorch
+FlashAttention
+xformers
+FlashAttention Triton 171 175 176
+162
+FlashAttention-1253
+132
+91 90 92 102 104 98 108 98 110 100 110 100
+68 73 76 77 75 75
+36 40 43 45 46
+OOM |     |     |     |     |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | --- | --- | --- |
+| 132
+10
+91 90 92
+68 73
+36 40                                                                                                                                                   |     |     |     | 2   |
+|                                                                                                                                                                               |     | 7   | 3   |     |
+|                                                                                                                                                                               |     |     |     |     |
+
+| Pytorch
+FlashAttention 196 201 203
+xformers 187
+FlashAttention 1T7r3iton
+Flas1h5A1ttention-2
+76 8378 6772 9185 7676 9590 7980 9693 8682 9795 83 9895
+53
+OOM |     |     |           |     |       |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | --- | --------- | --- | ----- |
+|                                                                                                                                                             |     |     |           |     | Tri
+2 |
+| 8378
+76
+53                                                                                                                                                  |     |     | 9185
+6772 |     |       |
+|                                                                                                                                                             | 378 |     |           |     |       |
+
+|     |
+| --- |
+|     |
+
+|     |
+| --- |
+|     |
+
+200 200
+
+|     |     |
+| --- | --- |
+|     |     |
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     | 82  |     |     |
+
+|     |     |     |
+| --- | --- | --- |
+| M   |     |     |
+
+|     |     |
+| --- | --- |
+|     |     |
+
+) s ) s
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     | 7   | 7   |     |
+|     |     |     |     |
+
+|     |     |     | 0   |
+| --- | --- | --- | --- |
+|     | 7   | 5   |     |
+|     |     |     |     |
+
+|     |     | 0   |
+| --- | --- | --- |
+| 7
+M | 5   |     |
+
+/ s / s P P
+
+|     |     |
+| --- | --- |
+| 76  |     |
+
+O 150 O 150 L L
+
+|     |     |     |
+| --- | --- | --- |
+| 6   | 8   |     |
+
+F F T T ( ( d 100 d 100 ee ee pS pS 50 50
+
+512 1k 2k 4k 8k 16k 512 1k 2k 4k 8k 16k Sequence length Sequence length (a) Without causal mask, head dimension 64 (b) Without causal mask, head dimension 128 Attention forward + backward speed (A100 80GB SXM4) Attention forward + backward speed (A100 80GB SXM4) Pytorch Pytorch
+
+|     |
+| --- |
+|     |
+
+|     |
+| --- |
+|     |
+
+FlashAttention FlashAttention 200 xformers 200 xformers 182 189
+
+|     |     |     |
+| --- | --- | --- |
+| M   |     |     |
+
+) s / FlashAttention Triton 165 171 ) s / FlashAttention Triton 173
+
+|     |
+| --- |
+|     |
+
+|     |
+| --- |
+|     |
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     |     |     |     |
+|     |     |     |     |
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     |     |     |     |
+|     |     |     |     |
+
+|     |     |     |
+| --- | --- | --- |
+| 6
+M | 7   |     |
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     |     |     |     |
+|     |     |     |     |
+
+s P FlashAttention-2 156 s P FlashAttention-2 155
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     | 6   | 8   |     |
+| 18  |     |     |     |
+
+|     |     |
+| --- | --- |
+| 68  |     |
+
+O 150 140 O 150
+
+|     |     |
+| --- | --- |
+| 66  |     |
+
+L L 133
+
+|     |     |
+| --- | --- |
+| 61  |     |
+
+F T 119 F T
+
+|     |     |     |
+| --- | --- | --- |
+| 6   | 0   |     |
+
+( ( 99 d 100 88 d 100 ee 77 ee 72 pS 5851 59 pS 5558 62 69 50 50 50 23 28 32 15 16 17 OOM OOM 512 1k 2k 4k 8k 16k 512 1k 2k 4k 8k 16k Sequence length Sequence length (c) With causal mask, head dimension 64 (d) With causal mask, head dimension 128 Figure 4: Attention forward + backward speed on A100 GPU
+
+10
+
+Attention forward speed (A100 80GB SXM4) Attention forward speed (A100 80GB SXM4) 227
+
+| Pytorch
+FlashAttention
+xformers 191
+178
+FlashAttention Triton
+FlashAttention-2
+141
+128
+9189 9694 99
+29 34 35 |     |     |            |     |     |     |     | 193 192 192 192
+149 152 152 155
+10499 10498 10498
+97
+37 37
+OOM |
+| ------------------------------------------------------------------------------------------------------------ | --- | --- | ---------- | --- | --- | --- | --- | -------------------------------------------------------------- |
+|                                                                                                              |     | h
+h |            |     |     |     |     |                                                                |
+| 12
+9189
+29                                                                                                   |     | 8   | 14
+9694
+34 |     |     |     | 1   |                                                                |
+|                                                                                                              |     |     |            |     |     | 4   |     |                                                                |
+|                                                                                                              | 9   |     |            |     |     |     |     |                                                                |
+|                                                                                                              |     |     |            |     |     |     |     |                                                                |
+|                                                                                                              |     |     |            |     |     |     |     |                                                                |
+
+| 2
+Pytorch
+209
+FlashAttention
+xformers
+FlashAttention
+FlashAttention- |     |     |     |       |              |     |     | 2
+Tri
+2 | 4
+ton
+1
+71
+60 |     | 15
+20 | 2   | 222 2
+157 16
+122 122
+71 6772
+63 |     |     |     | 2
+0 | 4 223
+163
+122
+73
+OOM |
+| -------------------------------------------------------------------- | --- | --- | --- | ----- | ------------ | --- | --- | ------- | ------------- | --- | ----- | --- | ------------------------------- | --- | --- | --- | --- | -------------------- |
+|                                                                      |     |     |     | m
+h
+h |              |     |     |         |               |     |       |     |                                 |     |     |     |     |                      |
+| 12
+107
+69
+42                                                         |     |     |     | 7     | 14
+115
+66
+56 |     |     | 0       |               |     |       |     |                                 |     |     | 2   |     |                      |
+|                                                                      |     |     |     |       |              |     | 5   |         |               |     |       |     |                                 |     |     |     |     |                      |
+|                                                                      |     |     | 7   |       |              |     |     |         |               |     |       |     |                                 |     |     |     |     |                      |
+|                                                                      |     |     |     |       |              |     |     |         |               |     |       |     |                                 |     |     |     |     |                      |
+|                                                                      |     |     |     |       |              |     |     |         |               |     |       |     |                                 |     |     |     |     |                      |
+
+200 200 ) s ) s / s / s P P
+
+|     |     | 9   |
+| --- | --- | --- |
+|     |     |     |
+|     |     |     |
+
+|     |     | 8   |
+| --- | --- | --- |
+|     |     |     |
+|     |     |     |
+
+|     | 8   |
+| --- | --- |
+| M   |     |
+
+|     |     | 2   |
+| --- | --- | --- |
+|     |     |     |
+
+|     | 2   |
+| --- | --- |
+| M   |     |
+
+O 150 O 150 L L F F T T ( ( d 100 d 100 ee ee pS pS 50 50
+
+512 1k 2k 4k 8k 16k 512 1k 2k 4k 8k 16k Sequence length Sequence length (a) Without causal mask, head dimension 64 (b) Without causal mask, head dimension 128 Attention forward speed (A100 80GB SXM4) Attention forward speed (A100 80GB SXM4)
+
+| Pytorch
+FlashAttention
+xformers 177 181 183
+FlashAttention Triton 167
+FlashAttention-1246
+143
+131 137
+115 112
+99 89 8992 9194 9495
+78 82 81
+71 70
+56
+10 10 10 10 10
+OOM |     |     |     |     |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | --- | --- | --- |
+| 115
+99
+78 82
+71 70
+56
+10 10                                                                                                                                             |     |     |     |     |
+|                                                                                                                                                                         |     |     | 2   |     |
+|                                                                                                                                                                         |     |     |     |     |
+|                                                                                                                                                                         |     |     |     |     |
+
+| Pytorch
+FlashAttention 198 200 197
+xformers 187
+FlashAttention 1T6r8iton
+FlashAttention-2 148
+141
+132 133
+126
+108 107 112 115 117
+89 95
+79
+59 65 68 70 71
+49
+15 18 19 19 19
+OOM |     |     |     |     |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | --- | --- | --- |
+| 132
+10
+89 95
+79
+59
+49
+15 18                                                                                                                                                     |     |     |     | 8   |
+|                                                                                                                                                                                 |     |     | 5   |     |
+|                                                                                                                                                                                 |     |     |     |     |
+|                                                                                                                                                                                 |     |     |     |     |
+
+200 200
+
+|     |     |     | 1   |
+| --- | --- | --- | --- |
+|     |     | 5   |     |
+|     |     |     |     |
+|     |     |     |     |
+
+|     |     | 8   |
+| --- | --- | --- |
+|     | 7   |     |
+| M   |     |     |
+
+) s ) s
+
+|     |     |     | 7   |
+| --- | --- | --- | --- |
+|     |     | 4   |     |
+|     |     |     |     |
+|     |     |     |     |
+
+|     |     | 3   |
+| --- | --- | --- |
+|     | 5   |     |
+| M   |     |     |
+
+/ s / s P P O 150 O 150 L L F F T T
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     |     | 1   |     |
+|     | 56  |     |     |
+|     |     |     |     |
+
+( ( d 100 d 100
+
+|     |     |
+| --- | --- |
+|     |     |
+
+ee ee pS pS
+
+|     |     |
+| --- | --- |
+|     |     |
+
+50 50
+
+512 1k 2k 4k 8k 16k 512 1k 2k 4k 8k 16k Sequence length Sequence length (c) With causal mask, head dimension 64 (d) With causal mask, head dimension 128 Figure 5: Attention forward speed on A100 GPU
+
+Just running the same implementation on H100 GPUs (using no special instructions to make use of new featuressuchasTMAand4th-genTensorCores), weobtainupto335TFLOPs/s(Fig.7). Weexpectthatby using new instructions, we can obtain another 1.5x-2x speedup on H100 GPUs. We leave that to future work.
+
+#### 4.2 End-to-end Performance
+
+We measure the training throughput of GPT-style models with either 1.3B or 2.7B parameters, on 8 × A100 80GB SXM. As shown in Table 1, FlashAttention-2 yields 2.8 × speedup compared to a baseline without FlashAttention and 1.3 × speedup compared to FlashAttention-2 , reaching up to 225 TFLOPs/s per A100 GPU. Note that we calculate the FLOPs by the formula, following Megatron-LM [16] (and many other papers and libraries): 6 · seqlen · number of params + 12 · number of layers · hidden dim · seqlen 2 . The first term accounts for the FLOPs due to weight–input multiplication, and the second term accounts for the FLOPs due to attention. However, one can argue that the second term should be halved, as with causal mask we only need to compute approximately half the number of elements in attention. We choose to follow the formula from the literature (without dividing the attention FLOPs by 2) for consistency.
+
+### 5 Discussion and Future Directions
+
+FlashAttention-2 is 2 × faster than FlashAttention , which means that we can train models with 16k longercontextforthesamepriceaspreviouslytraininga8kcontextmodel. Weareexcitedabouthowthiscan
+
+11
+
+Attention backward speed (A100 80GB SXM4) Attention backward speed (A100 80GB SXM4)
+
+| Pytorch
+F x l f a o s rm hA e t r t s ention 187 193 196
+FlashAttention Triton 175
+FlashAttention-1259
+136
+97
+7876 68 7375 84 74 86 79 88 77 888489 80 8690 82 8891 81
+59
+OOM |     |     |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | --- |
+| FlashAttention-
+136
+7876 68 7375 84 74
+59                                                                                                                                     |     | 2   |
+|                                                                                                                                                                               | 74  |     |
+
+Pytorch FlashAttention 200 xformers 200
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     |     |     |     |
+
+|     |     |     |
+| --- | --- | --- |
+| M   |     |     |
+
+) s / FlashAttention Triton 163 169 170 ) s / s P FlashAttention-2 152 s P
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     | 7   | 0   |     |
+|     |     |     |     |
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     | 6   | 9   |     |
+|     |     |     |     |
+
+|     |     |     |
+| --- | --- | --- |
+| 6
+M | 8   |     |
+
+|     |     |     |
+| --- | --- | --- |
+| 79  | 77  |     |
+
+O 150 141 O 150 L L
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     | 6   | 7   |     |
+|     |     |     |     |
+
+|     |      |     |
+| --- | ---- | --- |
+| 787 | 6
+68 |     |
+
+F 120 F T ( 106 T (
+
+|     |     |     |
+| --- | --- | --- |
+| 6   | 2   |     |
+
+d 100 87 d 100 ee ee
+
+|     |     |     |
+| --- | --- | --- |
+
+pS 70 pS 50 39 48 50 OOM 512 1k 2k 4k 8k 16k 512 1k 2k 4k 8k 16k Sequence length Sequence length (a) Without causal mask, head dimension 64 (b) Without causal mask, head dimension 128 Attention backward speed (A100 80GB SXM4) Attention backward speed (A100 80GB SXM4) Pytorch Pytorch FlashAttention FlashAttention 200 xformers 200 xformers 186 ) s / FlashAttention Triton 166 ) s / FlashAttention Triton 165 176
+
+|     |     |     |
+| --- | --- | --- |
+|     |     |     |
+
+|     |     |     |
+| --- | --- | --- |
+| M   |     |     |
+
+s P FlashAttention-2 149 160 s P FlashAttention-2
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     |     |     |     |
+|     |     |     |     |
+
+|     |     |     |
+| --- | --- | --- |
+| 6
+M | 0   |     |
+
+|     |     |     |
+| --- | --- | --- |
+|     |     |     |
+
+O 150 O 150 145
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     | 6   | 2   |     |
+|     |     |     |     |
+
+|     |     |
+| --- | --- |
+| 58  |     |
+
+L F 131 L F 122
+
+|     |     |     |
+| --- | --- | --- |
+|     | 52  |     |
+
+T 111 T ( (
+
+|     |     |     |     |
+| --- | --- | --- | --- |
+|     | 5   | 4   |     |
+|     |     |     |     |
+
+d 100 d 100 90 ee 81 76 71 ee 7175 pS 58 53 60 pS 5953 50 46 50 43 37 43 45 49 19 24 30 OOM OOM 512 1k 2k 4k 8k 16k 512 1k 2k 4k 8k 16k Sequence length Sequence length (c) With causal mask, head dimension 64 (d) With causal mask, head dimension 128 Figure 6: Attention backward speed on A100 GPU Table 1: Training speed (TFLOPs/s/GPU) of GPT-style models on 8 × A100 GPUs. FlashAttention-2 reachesupto225TFLOPs/s(72%modelFLOPsutilization). Wecompareagainstabaselinerunningwithout FlashAttention . Model Without FlashAttention FlashAttention FlashAttention-2 GPT3-1.3B 2k context 142 TFLOPs/s 189 TFLOPs/s 196 TFLOPs/s GPT3-1.3B 8k context 72 TFLOPS/s 170 TFLOPs/s 220 TFLOPs/s GPT3-2.7B 2k context 149 TFLOPs/s 189 TFLOPs/s 205 TFLOPs/s GPT3-2.7B 8k context 80 TFLOPs/s 175 TFLOPs/s 225 TFLOPs/s
+
+be used to understand long books and reports, high resolution images, audio and video. FlashAttention-2 will also speed up training, finetuning, and inference of existing models. In the near future, we plan to collaborate with researchers and engineers to make FlashAttention widely applicable in different kinds of devices (e.g., H100 GPUs, AMD GPUs), as well as new data types such as FP8. As an immediate next step, we plan to optimize FlashAttention-2 for H100 GPUs to use new hardware features (TMA, 4th-gen Tensor Cores, fp8). Combining the low-level optimizations in FlashAttention-2 with high-level algorithmic changes (e.g., local, dilated, block-sparse attention) could allow us to train AI models with much longer context. We are also excited to work with compiler researchers to make these optimization techniques easily programmable.
+
+12
+
+Attention forward + backward speed (H100 80GB SXM5) Attention forward + backward speed (H100 80GB SXM5)
+
+| Pytorch
+FlashAttention
+FlashAttention-2
+294 |     |
+| ------------------------------------------- | --- |
+| 248
+127 12012
+93                            | 7   |
+
+Pytorch FlashAttention 320 326 335 338
+
+|     | 8   |
+| --- | --- |
+|     |     |
+
+|     | 1   |
+| --- | --- |
+| 13  |     |
+
+|     | 7   |
+| --- | --- |
+| 13  |     |
+
+) s 300 FlashAttention-2 294 296 ) s 300
+
+|     | 288
+1 |
+| --- | ----- |
+|     |       |
+
+|     | 6   |
+| --- | --- |
+|     |     |
+
+/ s 274 / s
+
+|     | 1   |
+| --- | --- |
+|     |     |
+
+P 254 P O O L 215 L F F T 200 T 200 ( d 157 159 168 ( d ee ee 139 pS pS 100 100 62 72 OOM OOM 512 1k 2k 4k 8k 16k 512 1k 2k 4k 8k 16k Sequence length Sequence length (a) Without causal mask, head dimension 64 (b) Without causal mask, head dimension 128 Attention forward + backward speed (H100 80GB SXM5) Attention forward + backward speed (H100 80GB SXM5) Pytorch Pytorch FlashAttention FlashAttention 328 ) FlashAttention-2 ) FlashAttention-2 294 308
+
+|     | 6   |
+| --- | --- |
+|     |     |
+
+|     | 5   |
+| --- | --- |
+|     |     |
+
+s / 300 273 284 s / 300 s P 257 s P 265
+
+|     | 8   |
+| --- | --- |
+| 32  |     |
+
+|     | 9   |
+| --- | --- |
+| 32  |     |
+
+|     | 8   |
+| --- | --- |
+|     |     |
+
+O 232 O 221 L L
+
+|     | 9   |
+| --- | --- |
+|     |     |
+
+F T 200 192 F T 200 ( d 156 ( d 163 ee 141 136 ee 137 123 pS 104 pS 98 100 100 26 29 31 40 OOM OOM 512 1k 2k 4k 8k 16k 512 1k 2k 4k 8k 16k Sequence length Sequence length (c) With causal mask, head dimension 64 (d) With causal mask, head dimension 128 Figure 7: Attention forward + backward speed on H100 GPU
+
+Acknowledgments WethankPhilTilletandDanielHaziza,whohaveimplementedversionsof FlashAttention inTriton[17]and the xformers library[10]. FlashAttention-2 wasmotivatedbyexchangeofideasbetweendifferentwaysthat attentioncouldbeimplemented. WearegratefultotheNvidiaCUTLASSteam(especiallyVijayThakkar,Cris Cecka, Haicheng Wu, and Andrew Kerr) for their CUTLASS library, in particular the CUTLASS 3.x release, whichprovidescleanabstractionsandpowerfulbuildingblocksfortheimplementationof FlashAttention-2 . We thank Driss Guessous for integrating FlashAttention to PyTorch. FlashAttention-2 has benefited from helpful discussions with Phil Wang, Markus Rabe, James Bradbury, Young-Jun Ko, Julien Launay, Daniel Hesslow, Michaël Benesty, Horace He, Ashish Vaswani, and Erich Elsen. Thanks for Stanford CRFM and Stanford NLP for the compute support. We thank Dan Fu and Christopher Ré for their collaboration, constructive feedback, and constant encouragement on this line of work of designing hardware-efficient algorithms. We thank Albert Gu and Beidi Chen for their helpful suggestions on early drafts of this technical report.
+
+### References
+
+[1] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit Sanghai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints. arXiv preprint arXiv:2305.13245 , 2023. [2] Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer. arXiv preprint arXiv:2004.05150 , 2020.
+
+13
+
+[3] Beidi Chen, Tri Dao, Eric Winsor, Zhao Song, Atri Rudra, and Christopher Ré. Scatterbrain: Unifying sparse and low-rank attention. In Advances in Neural Information Processing Systems (NeurIPS) , 2021. [4] Krzysztof Marcin Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Quincy Davis, Afroz Mohiuddin, Lukasz Kaiser, et al. Rethinking attention with performers. In International Conference on Learning Representations (ICLR) , 2020. [5] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. FlashAttention: Fast and memory-efficient exact attention with IO-awareness. In Advances in Neural Information Processing Systems , 2022. [6] Zhe Jia and Peter Van Sandt. Dissecting the Ampere GPU architecture via microbenchmarking. GPU Technology Conference, 2021. [7] Zhe Jia, Marco Maggioni, Benjamin Staiger, and Daniele P Scarpazza. Dissecting the nvidia Volta GPU architecture via microbenchmarking. arXiv preprint arXiv:1804.06826 , 2018. [8] Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret. Transformers are RNNs: Fastautoregressivetransformerswithlinearattention. In International Conference on Machine Learning , pages 5156–5165. PMLR, 2020. [9] Nikita Kitaev, Łukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. In The International Conference on Machine Learning (ICML) , 2020. [10] Benjamin Lefaudeux, Francisco Massa, Diana Liskovich, Wenhan Xiong, Vittorio Caggiano, Sean Naren, MinXu,JieruHu,MartaTintore,SusanZhang,PatrickLabatut,andDanielHaziza.xformers: Amodular and hackable transformer modelling library. https://github.com/facebookresearch/xformers , 2022. [11] Maxim Milakov and Natalia Gimelshein. Online normalizer calculation for softmax. arXiv preprint arXiv:1805.02867 , 2018. [12] OpenAI. Gpt-4 technical report. ArXiv , abs/2303.08774, 2023. [13] Markus N Rabe and Charles Staats. Self-attention does not need 𝑂 ( 𝑛 2 ) memory. arXiv preprint arXiv:2112.05682 , 2021. [14] Aurko Roy, Mohammad Saffar, Ashish Vaswani, and David Grangier. Efficient content-based sparse attention with routing transformers. Transactions of the Association for Computational Linguistics , 9: 53–68, 2021. [15] Noam Shazeer. Fast transformer decoding: One write-head is all you need. arXiv preprint arXiv:1911.02150 , 2019. [16] MohammadShoeybi,MostofaPatwary,RaulPuri,PatrickLeGresley,JaredCasper,andBryanCatanzaro. Megatron-LM: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053 , 2019. [17] Philippe Tillet, Hsiang-Tsung Kung, and David Cox. Triton: an intermediate language and compiler for tiled neural network computations. In Proceedings of the 3rd ACM SIGPLAN International Workshop on Machine Learning and Programming Languages , pages 10–19, 2019. [18] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing systems , 30, 2017. [19] Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention with linear complexity. arXiv preprint arXiv:2006.04768 , 2020. [20] Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for longer sequences. Advances in Neural Information Processing Systems , 33, 2020.
+
+14
+
